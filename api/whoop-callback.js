@@ -29,7 +29,10 @@ export default async function handler(req, res) {
       whoop_access: access, whoop_refresh: refresh,
       whoop_expires: String(Date.now() + expiresIn * 1000),
     }).toString();
-    res.writeHead(302, { Location: '/health.html#' + hash });
+    const PAGES = ['health', 'peak'];
+    const state = (req.query && req.query.state) || '';
+    const page = PAGES.includes(state) ? state : 'health';
+    res.writeHead(302, { Location: '/' + page + '.html#' + hash });
     res.end();
   } catch (e) {
     res.status(500).send('Unexpected: ' + (e.message || String(e)));

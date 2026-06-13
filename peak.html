@@ -325,6 +325,73 @@ body{ background:var(--bg); color:var(--fg); font-family:var(--ui); -webkit-font
  * All scores reuse the suite's real calculation logic.
  * ============================================================ */
 function readLS(k){ try{ const r=localStorage.getItem(k); return r?JSON.parse(r):null; }catch(e){ return null; } }
+
+/* ----- Whoop OAuth (shared tokens with health.html) ----- */
+const WHOOP_KEY = 'whoop_tokens_v1';
+const WHOOP_CLIENT_ID = '5d3dfb04-63d1-4400-be8d-602cb3020d6e';
+const WHOOP_SCOPES = 'read:recovery read:sleep read:workout read:cycles read:profile read:body_measurement offline';
+function loadWhoopTokens(){ return readLS(WHOOP_KEY); }
+function saveWhoopTokens(t){ try{ localStorage.setItem(WHOOP_KEY,JSON.stringify(t)); }catch(e){} }
+(function captureWhoopHash(){
+  if(location.hash && location.hash.indexOf('whoop_access')!==-1){
+    const h=new URLSearchParams(location.hash.slice(1));
+    const access=h.get('whoop_access'), refresh=h.get('whoop_refresh');
+    const expires=Number(h.get('whoop_expires'))||(Date.now()+3500*1000);
+    if(access){ saveWhoopTokens({access,refresh,expires}); history.replaceState(null,'',location.pathname+location.search); }
+  }
+})();
+function connectWhoop(){
+  const redirect = location.origin + '/api/whoop-callback';
+  const url = 'https://api.prod.whoop.com/oauth/oauth2/auth'
+    + '?client_id=' + encodeURIComponent(WHOOP_CLIENT_ID)
+    + '&redirect_uri=' + encodeURIComponent(redirect)
+    + '&response_type=code'
+    + '&scope=' + encodeURIComponent(WHOOP_SCOPES)
+    + '&state=peak';
+  location.href = url;
+}
+async function refreshWhoopToken(t){
+  if(!t.refresh) return null;
+  try{
+    const r=await fetch('/api/whoop-refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:t.refresh})});
+    const j=await r.json();
+    if(j.access_token){ const next={access:j.access_token,refresh:j.refresh_token||t.refresh,expires:Date.now()+(j.expires_in||3500)*1000}; saveWhoopTokens(next); return next; }
+  }catch(e){} return null;
+}
+async function whoopFetch(path,t){
+  const [p,qs]=path.split('?');
+  const params=new URLSearchParams(qs||''); params.set('path',p);
+  const r=await fetch('/api/whoop-data?'+params.toString(),{headers:{'Authorization':'Bearer '+t.access,'Accept':'application/json'}});
+  if(r.status===401){ const n=await refreshWhoopToken(t); if(n) return whoopFetch(path,n); throw new Error('unauthorized'); }
+  if(!r.ok) throw new Error('WHOOP '+r.status+': '+(await r.text()));
+  return await r.json();
+}
+async function fetchWhoopSnapshot(){
+  let t=loadWhoopTokens(); if(!t||!t.access) return null;
+  if(t.expires && Date.now()>t.expires-60000){ const n=await refreshWhoopToken(t); if(!n) throw new Error('unauthorized'); t=n; }
+  const [rec,sleep,cycle]=await Promise.all([
+    whoopFetch('/recovery?limit=1',t).catch(()=>null),
+    whoopFetch('/activity/sleep?limit=1',t).catch(()=>null),
+    whoopFetch('/cycle?limit=1',t).catch(()=>null),
+  ]);
+  const r=rec&&rec.records&&rec.records[0]&&rec.records[0].score;
+  const s=sleep&&sleep.records&&sleep.records[0]&&sleep.records[0].score;
+  const c=cycle&&cycle.records&&cycle.records[0]&&cycle.records[0].score;
+  const ss=s&&s.stage_summary;
+  const sleepMs=ss?((ss.total_in_bed_time_milli||0)-(ss.total_awake_time_milli||0)):null;
+  const needed=s&&s.sleep_needed;
+  const targetMs=needed?((needed.baseline_milli||0)+(needed.need_from_sleep_debt_milli||0)+(needed.need_from_recent_strain_milli||0)-(needed.need_from_recent_nap_milli||0)):null;
+  return {
+    source:'whoop', connected:true, ts:Date.now(),
+    recovery: r?(r.recovery_score||0):null,
+    sleepHours: sleepMs!=null?sleepMs/3600000:null,
+    sleepPerf: s?(s.sleep_performance_percentage||0):null,
+    sleepTargetHours: targetMs!=null?targetMs/3600000:8,
+    hrv: r?(r.hrv_rmssd_milli||0):null,
+    rhr: r?(r.resting_heart_rate||0):null,
+    strain: c?(c.strain!=null?c.strain:null):null,
+  };
+}
 // per-render caches (the energy curve reads these hundreds of times) — cleared at the top of render()
 let _hl,_prof,_stim,_feelC,_med,_recHist,_hrvB,_rhrB,_sdebt,_smoker,_hab,_chrono;
 function clearCaches(){ _hl=_prof=_stim=_feelC=_med=_recHist=_hrvB=_rhrB=_sdebt=_smoker=_hab=_chrono=undefined; }
@@ -1039,13 +1106,14 @@ async function pickSource(src){
   if(src==='whoop'){
     const cached=readLS('patron_health_v1');
     const haveWhoop = cached && cached.source==='whoop' && cached.connected;
-    try{ const r=await fetch('/api/whoop/data',{cache:'no-store'}); const j=await r.json();
-      if(j&&j.connected){ saveHealth({source:'whoop',connected:true,ts:j.ts||Date.now(),recovery:j.recovery,sleepHours:j.sleepHours,sleepPerf:j.sleepPerf,sleepTargetHours:j.sleepTargetHours||8,hrv:j.hrv,rhr:j.rhr,strain:j.strain}); render(); return; }
-    }catch(e){}
-    // Live refresh didn't confirm a connection. If we already have Whoop data, just
-    // keep showing it — never bounce to a (possibly failing) re-login automatically.
+    const t=loadWhoopTokens();
+    if(t&&t.access){
+      try{ const snap=await fetchWhoopSnapshot(); if(snap){ saveHealth(snap); render(); return; } }catch(e){}
+      // Live refresh failed. If we already have Whoop data, keep showing it.
+      if(haveWhoop){ render(); return; }
+    }
     if(haveWhoop){ render(); return; }
-    if(confirm('Connect your Whoop account? You’ll log in on whoop.com.')) location.href='/api/whoop/login';
+    if(confirm('Connect your Whoop account? You’ll log in on whoop.com.')) connectWhoop();
     else { selectedSrc=null; render(); }
     return;
   }
